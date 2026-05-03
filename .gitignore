@@ -1,0 +1,5 @@
+# Action artifacts that get generated when the smoke workflow runs locally
+reports/
+*.sarif
+*.html
+.DS_Store

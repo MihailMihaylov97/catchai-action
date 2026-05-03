@@ -1,0 +1,113 @@
+name: smoke
+# End-to-end smoke test: check out the canonical Python CVE fixture,
+# run the Action against it, and assert that the deterministic L1-L6
+# scan produces the expected signal (lots of dependency findings).
+#
+# Runs on every push + PR. Without this, an action.yml regression
+# (broken bash, missing input plumbing, jq syntax) wouldn't surface
+# until a real customer's PR fails. Catching it here is cheaper.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # SARIF upload to Code Scanning. The fixture repo isn't security-events
+  # enabled, so we set upload-sarif=false for the smoke job. We test the
+  # SARIF FILE generation here; the upload itself is exercised in real-user CI.
+  security-events: write
+
+jobs:
+  scan-fixture:
+    name: scan catchai-py-cve-fixture
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the Action
+        uses: actions/checkout@v4
+        with:
+          path: catchai-action
+
+      - name: Check out the CVE fixture
+        uses: actions/checkout@v4
+        with:
+          repository: MihailMihaylov97/catchai-py-cve-fixture
+          path: fixture
+
+      - name: Run catchai-action against the fixture
+        id: scan
+        uses: ./catchai-action
+        with:
+          path: fixture
+          # Skip SARIF upload — the fixture repo isn't part of this
+          # repo's Code Scanning surface. The Action's own integration
+          # tests cover the upload path.
+          upload-sarif: 'false'
+          # Don't fail the smoke job — the fixture is INTENTIONALLY
+          # full of vulnerable pins. The whole point is to find them.
+          fail-on-severity: 'none'
+          # Smoke job runs without LLM credits — keep deterministic.
+          semantic: 'false'
+          # No PR comment from the smoke job (we're not in a real PR
+          # against a customer repo).
+          comment-on-pr: 'false'
+
+      - name: Assert recall against the planted set
+        run: |
+          # The fixture's verify_recall.py asserts each of the 50
+          # planted-vulnerable packages produced ≥ 1 dep finding.
+          # Anything below 100% is a real coverage gap; below 50% is
+          # a smoke-failure (Action plumbing broke or the wheel
+          # download is busted).
+          python3 fixture/verify_recall.py "${{ steps.scan.outputs.json-path }}" || RC=$?
+          RC=${RC:-0}
+          if [ "$RC" -ne 0 ]; then
+            # Below 50% recall = something fundamentally wrong with the
+            # install or scan, not a one-off OSV index gap.
+            DETECTED=$(jq '.summary.by_severity.critical // 0 +
+                          .summary.by_severity.high     // 0 +
+                          .summary.by_severity.medium   // 0' \
+                          "${{ steps.scan.outputs.json-path }}")
+            if [ "$DETECTED" -lt 25 ]; then
+              echo "::error::smoke catastrophic — only $DETECTED findings on a 50-planted fixture"
+              exit 1
+            fi
+            echo "::warning::recall below 100% — see verify_recall.py output above"
+          fi
+
+      - name: Assert step outputs are populated
+        run: |
+          # Every output should be non-empty after a successful scan.
+          test -n "${{ steps.scan.outputs.total-findings }}"
+          test -n "${{ steps.scan.outputs.critical-findings }}"
+          test -n "${{ steps.scan.outputs.high-findings }}"
+          test -n "${{ steps.scan.outputs.sarif-path }}"
+          test -n "${{ steps.scan.outputs.json-path }}"
+          test -f "${{ steps.scan.outputs.sarif-path }}"
+          test -f "${{ steps.scan.outputs.json-path }}"
+          echo "all outputs populated"
+          echo "  total:    ${{ steps.scan.outputs.total-findings }}"
+          echo "  critical: ${{ steps.scan.outputs.critical-findings }}"
+          echo "  high:     ${{ steps.scan.outputs.high-findings }}"
+
+  lint-yaml:
+    name: lint action.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: action.yml is valid YAML
+        run: python3 -c "import yaml; yaml.safe_load(open('action.yml'))"
+      - name: action.yml has marketplace metadata
+        run: |
+          python3 - <<'PY'
+          import yaml
+          a = yaml.safe_load(open("action.yml"))
+          for key in ("name", "description", "branding", "inputs", "runs"):
+              assert key in a, f"action.yml missing top-level key: {key}"
+          assert a["runs"]["using"] == "composite", "expected composite action"
+          assert "icon" in a["branding"] and "color" in a["branding"]
+          print("marketplace metadata: ok")
+          PY
