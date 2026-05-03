@@ -55,28 +55,45 @@ jobs:
           # against a customer repo).
           comment-on-pr: 'false'
 
-      - name: Assert recall against the planted set
+      - name: Run recall diagnostic (informational only — no fail-on)
+        # The fixture's verify_recall.py reports per-package PASS/MISS.
+        # We surface its output for visibility but DON'T fail the smoke
+        # job on its exit code: <100% recall is the expected steady state
+        # (OSV index gaps for older versions of less-popular packages
+        # like pyramid 1.10, falcon 2.0, httplib2 0.19, etc.). Genuine
+        # smoke failures (install broken, scan crashed, no findings at
+        # all) are caught by the next step.
         run: |
-          # The fixture's verify_recall.py asserts each of the 50
-          # planted-vulnerable packages produced ≥ 1 dep finding.
-          # Anything below 100% is a real coverage gap; below 50% is
-          # a smoke-failure (Action plumbing broke or the wheel
-          # download is busted).
-          python3 fixture/verify_recall.py "${{ steps.scan.outputs.json-path }}" || RC=$?
-          RC=${RC:-0}
-          if [ "$RC" -ne 0 ]; then
-            # Below 50% recall = something fundamentally wrong with the
-            # install or scan, not a one-off OSV index gap.
-            DETECTED=$(jq '.summary.by_severity.critical // 0 +
-                          .summary.by_severity.high     // 0 +
-                          .summary.by_severity.medium   // 0' \
-                          "${{ steps.scan.outputs.json-path }}")
-            if [ "$DETECTED" -lt 25 ]; then
-              echo "::error::smoke catastrophic — only $DETECTED findings on a 50-planted fixture"
-              exit 1
-            fi
-            echo "::warning::recall below 100% — see verify_recall.py output above"
+          set +e
+          python3 fixture/verify_recall.py "${{ steps.scan.outputs.json-path }}"
+          set -e
+
+      - name: Assert smoke baseline — scan produced findings + reports exist
+        run: |
+          # Pure smoke contract: scan produced SOMETHING. Zero findings
+          # on a 50-planted-vulnerable fixture means the L1 dep path is
+          # fundamentally broken — install corrupt, OSV unreachable,
+          # ingestion regression, etc.
+          DEP_FINDINGS=$(jq '[.findings[]? | select(.layer == "dependency")] | length' \
+            "${{ steps.scan.outputs.json-path }}")
+          echo "Dependency findings produced: $DEP_FINDINGS"
+          if [ "$DEP_FINDINGS" -lt 25 ]; then
+            echo "::error::smoke catastrophic — only $DEP_FINDINGS dep findings on a 50-planted fixture"
+            exit 1
           fi
+
+          # Cross-check via summary block (jq operator precedence: parens
+          # are required to sum-then-default, NOT default-then-sum, since
+          # `//` binds tighter than the outer `+` chain).
+          TOTAL=$(jq '(.summary.by_severity.critical // 0)
+                    + (.summary.by_severity.high     // 0)
+                    + (.summary.by_severity.medium   // 0)
+                    + (.summary.by_severity.low      // 0)' \
+                    "${{ steps.scan.outputs.json-path }}")
+          echo "summary by_severity sum (excluding info): $TOTAL"
+          test "$TOTAL" -gt 0
+
+      - name: Assert step outputs are populated
 
       - name: Assert step outputs are populated
         run: |
