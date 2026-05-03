@@ -94,8 +94,6 @@ jobs:
           test "$TOTAL" -gt 0
 
       - name: Assert step outputs are populated
-
-      - name: Assert step outputs are populated
         run: |
           # Every output should be non-empty after a successful scan.
           test -n "${{ steps.scan.outputs.total-findings }}"
